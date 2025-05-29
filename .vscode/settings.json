@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "flags.h": "c",
+        "stdint.h": "c",
+        "interrupt.h": "c",
+        "intr-stubs.h": "c",
+        "switch.h": "c",
+        "fixed_point.h": "c"
+    }
+}
