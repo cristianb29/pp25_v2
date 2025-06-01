@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -89,18 +90,41 @@ struct thread
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
+		struct thread *parent;
+		void *esp;
+		struct file *file_leak;							/* prevent memory leak */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
-#ifdef USERPROG
+		struct list_elem child_elem;
+		struct list child_list;
+		struct semaphore *wait_sema;
+		struct list file_list;
+		struct list mmap_list;
+		struct list_elem execute_elem;
+		struct semaphore load_sema;
+		struct semaphore exit_sema;
+		struct semaphore pagedir_sema;
+
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
-#endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
   };
+
+struct status{
+	tid_t tid;
+	int exit_status;
+	struct list_elem elem;
+};
+
+struct file_descriptor{
+	int fd;
+	struct file *file_p;
+	struct list_elem elem;
+};
 
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
@@ -137,5 +161,10 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+int check_status(int);
+int get_and_remove_status(int);
+void set_exit_status(int);
+bool check_executing(const char *);
 
 #endif /* threads/thread.h */

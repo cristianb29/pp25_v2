@@ -15,8 +15,11 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/syscall.h"
+#include "vm/vm.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -25,10 +28,12 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
+	
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  char *file_name2,*fn_copy,*token,*save_ptr;
+	struct file *file_p;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
@@ -36,12 +41,33 @@ process_execute (const char *file_name)
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
+	file_name2 = palloc_get_page(0);
+	if(file_name2 == NULL){
+		palloc_free_page(fn_copy);
+		return TID_ERROR;
+	}
   strlcpy (fn_copy, file_name, PGSIZE);
+	strlcpy (file_name2,file_name,PGSIZE);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+	token = strtok_r(file_name2," ",&save_ptr);
+	sema_down(&file_sema);
+	file_p = filesys_open(token);
+	sema_up(&file_sema);
+	if(file_p == NULL){
+		palloc_free_page(fn_copy);
+		palloc_free_page(file_name2);
+		return TID_ERROR;
+	}
+  tid = thread_create (token, PRI_DEFAULT, start_process, fn_copy);
+	sema_down(&thread_current()->load_sema);
+  if (tid == TID_ERROR){
     palloc_free_page (fn_copy); 
+		palloc_free_page (file_name2);
+	}else{
+		palloc_free_page (file_name2);
+		if(check_status(tid) == -1) return process_wait(tid);
+	}
   return tid;
 }
 
@@ -50,21 +76,78 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
+	int len,argc;
   char *file_name = file_name_;
+	char *token,*save_ptr,*fn_copy;
   struct intr_frame if_;
   bool success;
+	void *esp;
 
   /* Initialize interrupt frame and load executable. */
-  memset (&if_, 0, sizeof if_);
-  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
-  if_.cs = SEL_UCSEG;
-  if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+ 	memset (&if_, 0, sizeof if_);
+ 	if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+ 	if_.cs = SEL_UCSEG;
+ 	if_.eflags = FLAG_IF | FLAG_MBS;
+	fn_copy = palloc_get_page(0);
+	if(fn_copy == NULL){
+		palloc_free_page(file_name);
+		sema_up(&thread_current()->parent->load_sema);
+		syscall_exit(-1);
+		// these two operations must be atomic but it is not implemented yet.
+	}
+	strlcpy(fn_copy,file_name,PGSIZE);
+	success = load (strtok_r(file_name," ",&save_ptr), &if_.eip, &if_.esp);
+	
+		/* If load failed, quit. */
+	if(!success){
+		palloc_free_page(file_name);
+		palloc_free_page(fn_copy);
+		sema_up(&thread_current()->parent->load_sema);
+		syscall_exit(-1);
+		// these two operations must be atomic but it is not implemented yet.
+	}else{
+		sema_up(&thread_current()->parent->load_sema);
+		argc = 0;
+		esp = if_.esp;
+		len = strlen(fn_copy);
+		for(int i=0; i<len/2; i++){
+			char tmp = fn_copy[i];
+			fn_copy[i] = fn_copy[len-1-i];
+			fn_copy[len-1-i] = tmp;
+		}
+		strlcpy(file_name,fn_copy,PGSIZE);
+		for(token=strtok_r(file_name," ",&save_ptr); token != NULL; token=strtok_r(NULL," ",&save_ptr)){
+			argc++;
+			len = strlen(token);
+			if_.esp = (uint32_t)if_.esp-1;
+			*(char *)if_.esp = '\0';
+			for(int i=0; i<len; i++){
+				if_.esp = (uint32_t)if_.esp-1;
+				*(char *)if_.esp = token[i];
+			}
+		}
+		while((uint32_t)if_.esp%4 != 0){
+			if_.esp = (uint32_t)if_.esp-1;
+			*(char *)if_.esp = (uint8_t)0;
+		}
+		if_.esp = (uint32_t)if_.esp-4;
+		*(int *)if_.esp = (uint32_t)0;
+		for(token=strtok_r(fn_copy," ",&save_ptr); token != NULL; token=strtok_r(NULL," ",&save_ptr)){
+			if_.esp = (uint32_t)if_.esp-4;
+			esp = (uint32_t)esp - (1+strlen(token));
+			*(int *)if_.esp = (uint32_t)esp;
+		}
+		esp = if_.esp;
+		if_.esp = (uint32_t)if_.esp-4;
+		*(int *)if_.esp = esp;
+		if_.esp = (uint32_t)if_.esp-4;
+		*(int *)if_.esp = argc;
+		if_.esp = (uint32_t)if_.esp-4;
+		*(int *)if_.esp = (uint32_t)0;
 
-  /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+	 	palloc_free_page (file_name);
+		palloc_free_page (fn_copy);
+	}
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -88,21 +171,75 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+	int ret;
+	struct thread *cur,*child;
+	struct list_elem *e,*child_e;
+	struct semaphore *sema;
+	enum intr_level old_level;
+
+	old_level = intr_disable();
+	cur = thread_current();
+	for(e=list_begin(&cur->child_list); e!=list_end(&cur->child_list); e=list_next(e)){
+		child = list_entry(e,struct thread,child_elem);
+		if(child->tid == child_tid){
+			child_e = e;
+			break;
+		}
+	}
+	if(e == list_end(&cur->child_list)){
+		return -1;
+	}
+	list_remove(child_e);
+	if(child->wait_sema == NULL){ // maybe race condition?
+		child->wait_sema = (struct semaphore *)malloc(sizeof(struct semaphore));
+		sema_init(child->wait_sema,0);
+	}
+	sema = child->wait_sema;
+	intr_set_level(old_level);
+	sema_down(sema);
+	free(sema);
+	old_level = intr_disable();
+	ret = get_and_remove_status(child_tid);
+	intr_set_level(old_level);
+	sema_up(&child->exit_sema);
+
+  return ret;
 }
 
 /* Free the current process's resources. */
 void
 process_exit (void)
 {
+	struct list_elem *e;
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+
+	while(true){
+		e = list_begin(&cur->mmap_list);
+		if(e == list_end(&cur->mmap_list)) break;
+		syscall_munmap(list_entry(e,struct mmap_descriptor,elem)->mapid);
+	}
+
+	//sema_down(&file_sema);
+	//sema_down(&flist_sema);
+	for(e=list_begin(&cur->file_list); e!=list_end(&cur->file_list);){
+		struct file_descriptor *tmp = list_entry(e,struct file_descriptor,elem);
+		e = list_remove(e);
+		file_close(tmp->file_p);
+		free(tmp);
+	}
+	//sema_up(&flist_sema);
+	//sema_up(&file_sema);
+	// if we remove // then we fail at some test cases in userprog
+	// I don't understand why this happen.
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+			sptable_clean(pd);
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
@@ -222,13 +359,16 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
+	sema_down(&file_sema);
   file = filesys_open (file_name);
+	sema_up(&file_sema);
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
 
+	sema_down(&file_sema);
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -239,8 +379,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phnum > 1024) 
     {
       printf ("load: %s: error loading executable\n", file_name);
+			sema_up(&file_sema);
       goto done; 
     }
+	sema_up(&file_sema);
 
   /* Read program headers. */
   file_ofs = ehdr.e_phoff;
@@ -250,10 +392,14 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
       if (file_ofs < 0 || file_ofs > file_length (file))
         goto done;
+			sema_down(&file_sema);
       file_seek (file, file_ofs);
 
-      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr){
+				sema_up(&file_sema);
         goto done;
+			}
+			sema_up(&file_sema);
       file_ofs += sizeof phdr;
       switch (phdr.p_type) 
         {
@@ -292,8 +438,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
                   zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
                 }
               if (!load_segment (file, file_page, (void *) mem_page,
-                                 read_bytes, zero_bytes, writable))
-                goto done;
+                                 read_bytes, zero_bytes, writable)){
+                	goto done;
+								}
             }
           else
             goto done;
@@ -312,13 +459,14 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  //file_close (file);
+	thread_current()->file_leak = file;
   return success;
 }
 
 /* load() helpers. */
 
-static bool install_page (void *upage, void *kpage, bool writable);
+bool install_page (void *upage, void *kpage, bool writable);
 
 /* Checks whether PHDR describes a valid, loadable segment in
    FILE and returns true if so, false otherwise. */
@@ -330,8 +478,12 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
     return false; 
 
   /* p_offset must point within FILE. */
-  if (phdr->p_offset > (Elf32_Off) file_length (file)) 
+	sema_down(&file_sema);
+  if (phdr->p_offset > (Elf32_Off) file_length (file)){
+		sema_up(&file_sema);
     return false;
+	}
+	sema_up(&file_sema);
 
   /* p_memsz must be at least as big as p_filesz. */
   if (phdr->p_memsz < phdr->p_filesz) 
@@ -387,7 +539,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
+	sema_down(&file_sema);
   file_seek (file, ofs);
+	sema_up(&file_sema);
   while (read_bytes > 0 || zero_bytes > 0) 
     {
       /* Calculate how to fill this page.
@@ -395,18 +549,32 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
          and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
+			
+			if(page_read_bytes == PGSIZE || page_zero_bytes == PGSIZE){
+				lazy_loading(page_read_bytes,page_zero_bytes,file,upage,ofs,writable);
+				ofs += page_read_bytes;
+				read_bytes -= page_read_bytes;
+				zero_bytes -= page_zero_bytes;
+				upage += PGSIZE;
+				continue;
+			}
 
       /* Get a page of memory. */
       uint8_t *kpage = palloc_get_page (PAL_USER);
       if (kpage == NULL)
         return false;
 
+			sema_down(&file_sema);
       /* Load this page. */
+			file_seek(file,ofs);
       if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
         {
+					sema_up(&file_sema);
           palloc_free_page (kpage);
           return false; 
         }
+			sema_up(&file_sema);
+      
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
 
       /* Add the page to the process's address space. */
@@ -417,6 +585,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
         }
 
       /* Advance. */
+			ofs += page_read_bytes;
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
@@ -436,9 +605,9 @@ setup_stack (void **esp)
   if (kpage != NULL) 
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
+      if (success){
         *esp = PHYS_BASE;
-      else
+      }else
         palloc_free_page (kpage);
     }
   return success;
@@ -453,7 +622,7 @@ setup_stack (void **esp)
    with palloc_get_page().
    Returns true on success, false if UPAGE is already mapped or
    if memory allocation fails. */
-static bool
+bool
 install_page (void *upage, void *kpage, bool writable)
 {
   struct thread *t = thread_current ();

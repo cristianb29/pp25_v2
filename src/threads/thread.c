@@ -4,6 +4,8 @@
 #include <random.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include "threads/malloc.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -14,11 +16,15 @@
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+#include "filesys/file.h"
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
+
+static struct list execute_list;
+static struct list status_list;
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
@@ -92,11 +98,13 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+	list_init (&status_list);
+	list_init (&execute_list);
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
   init_thread (initial_thread, "main", PRI_DEFAULT);
-  initial_thread->status = THREAD_RUNNING;
+	initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
 }
 
@@ -166,7 +174,8 @@ tid_t
 thread_create (const char *name, int priority,
                thread_func *function, void *aux) 
 {
-  struct thread *t;
+  struct thread *t,*cur;
+	struct status *stat;
   struct kernel_thread_frame *kf;
   struct switch_entry_frame *ef;
   struct switch_threads_frame *sf;
@@ -182,6 +191,19 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+
+	stat = (struct status *)malloc(sizeof(struct status));
+	stat->tid = tid;
+
+	enum intr_level old_level = intr_disable();
+	
+	cur = thread_current();
+	t->parent = cur;
+	list_push_back(&status_list,&stat->elem);
+	list_push_back(&cur->child_list,&t->child_elem);
+	t->wait_sema = (struct semaphore *)malloc(sizeof(struct semaphore));
+	sema_init(t->wait_sema,0);
+	intr_set_level(old_level);
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -289,8 +311,26 @@ thread_exit (void)
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
-  intr_disable ();
-  list_remove (&thread_current()->allelem);
+	intr_disable();
+	struct thread *cur,*tmp;
+	struct list_elem *e;
+
+	cur = thread_current();
+	file_close(cur->file_leak);
+	for(e=list_begin(&cur->child_list); e!=list_end(&cur->child_list);){
+		tmp = list_entry(e,struct thread,child_elem);
+		//process_wait(tmp->tid);
+		e = list_remove(e);
+	}
+	if(cur->wait_sema == NULL){
+		cur->wait_sema = (struct semaphore *)malloc(sizeof(struct semaphore));
+		sema_init(cur->wait_sema,0);
+	}
+	sema_up(cur->wait_sema);
+	sema_down(&cur->exit_sema);
+
+  list_remove (&cur->allelem);
+	list_remove (&cur->execute_elem);
   thread_current ()->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
@@ -463,9 +503,17 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+	t->file_leak = NULL;
 
   old_level = intr_disable ();
-  list_push_back (&all_list, &t->allelem);
+	list_init(&t->child_list);
+	list_init(&t->file_list);
+	list_init(&t->mmap_list);
+	list_push_back(&all_list,&t->allelem);
+	list_push_back(&execute_list,&t->execute_elem);
+	sema_init(&t->load_sema,0);
+	sema_init(&t->exit_sema,0);
+	sema_init(&t->pagedir_sema,1);
   intr_set_level (old_level);
 }
 
@@ -582,3 +630,74 @@ allocate_tid (void)
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+int check_status(int tid){
+	struct list_elem *e;
+	struct status *tmp;
+	enum intr_level old_level;
+
+	old_level = intr_disable();
+	e = list_begin(&status_list);
+	while(true){
+		tmp = list_entry(e,struct status,elem);
+		if(tmp->tid == tid) break;
+		e = list_next(e);
+	}
+	if(tmp->tid != tid) return 0; // not found
+	intr_set_level(old_level);
+
+	return tmp->exit_status;
+}
+
+int get_and_remove_status(int tid){
+	int ret;
+	struct list_elem *e;
+	struct status *tmp;
+
+	e = list_begin(&status_list);
+	while(true){
+		tmp = list_entry(e,struct status,elem);
+		if(tmp->tid == tid) break;
+		e = list_next(e);
+	}
+	ASSERT(tmp->tid == tid);
+	ret = tmp->exit_status;
+	list_remove(e);
+
+	return ret;
+}
+
+void set_exit_status(int stat){
+	tid_t cur_tid;
+	struct list_elem *e;
+	struct status *tmp;
+	enum intr_level old_level;
+
+	old_level = intr_disable();
+	cur_tid = thread_current()->tid;
+	for(e=list_begin(&status_list); e!=list_end(&status_list); e=list_next(e)){
+		tmp = list_entry(e,struct status,elem);
+		if(tmp->tid == cur_tid){
+			tmp->exit_status = stat;
+			break;
+		}
+	}
+	intr_set_level(old_level);
+}
+
+bool check_executing(const char *file){
+	struct list_elem *e;
+	struct thread *tmp;
+	enum intr_level old_level;
+	bool ret = false;
+
+	for(e=list_begin(&execute_list); e!=list_end(&execute_list); e=list_next(e)){
+		tmp = list_entry(e,struct thread,execute_elem);
+		if(strcmp(tmp->name,file) == 0){
+			ret = true;
+			break;
+		}
+	}
+
+	return ret;
+}

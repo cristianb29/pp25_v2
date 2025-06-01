@@ -5,6 +5,9 @@
 #include "threads/init.h"
 #include "threads/pte.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
+#include "threads/thread.h"
+#include "vm/vm.h"
 
 static uint32_t *active_pd (void);
 static void invalidate_pagedir (uint32_t *);
@@ -29,8 +32,9 @@ pagedir_destroy (uint32_t *pd)
 {
   uint32_t *pde;
 
-  if (pd == NULL)
+  if (pd == NULL){
     return;
+	}
 
   ASSERT (pd != init_page_dir);
   for (pde = pd; pde < pd + pd_no (PHYS_BASE); pde++)
@@ -71,8 +75,9 @@ lookup_page (uint32_t *pd, const void *vaddr, bool create)
       if (create)
         {
           pt = palloc_get_page (PAL_ZERO);
-          if (pt == NULL) 
+          if (pt == NULL){
             return NULL; 
+					}
       
           *pde = pde_create (pt);
         }
@@ -88,7 +93,7 @@ lookup_page (uint32_t *pd, const void *vaddr, bool create)
 /* Adds a mapping in page directory PD from user virtual page
    UPAGE to the physical frame identified by kernel virtual
    address KPAGE.
-   UPAGE must not already be mapped.
+   UPAGE must not already be mapped. <- checking this statement is hard. So I just skipped this.
    KPAGE should probably be a page obtained from the user pool
    with palloc_get_page().
    If WRITABLE is true, the new page is read/write;
@@ -99,6 +104,7 @@ bool
 pagedir_set_page (uint32_t *pd, void *upage, void *kpage, bool writable)
 {
   uint32_t *pte;
+	bool ret;
 
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (pg_ofs (kpage) == 0);
@@ -106,16 +112,49 @@ pagedir_set_page (uint32_t *pd, void *upage, void *kpage, bool writable)
   ASSERT (vtop (kpage) >> PTSHIFT < init_ram_pages);
   ASSERT (pd != init_page_dir);
 
+	//sema_down(&thread_current()->pagedir_sema);
   pte = lookup_page (pd, upage, true);
 
   if (pte != NULL) 
     {
       ASSERT ((*pte & PTE_P) == 0);
       *pte = pte_create_user (kpage, writable);
-      return true;
+			sptable_insert(pd,upage,kpage,writable,true);
+      ret = true;
     }
   else
-    return false;
+    ret = false;
+
+	//sema_up(&thread_current()->pagedir_sema);
+	return ret;
+}
+
+bool pagedir_set_page2 (uint32_t *pd, void *upage, void *kpage, bool writable,bool evict)
+{
+  uint32_t *pte;
+	bool ret;
+
+  ASSERT (pg_ofs (upage) == 0);
+  ASSERT (pg_ofs (kpage) == 0);
+  ASSERT (is_user_vaddr (upage));
+  ASSERT (vtop (kpage) >> PTSHIFT < init_ram_pages);
+  ASSERT (pd != init_page_dir);
+
+	//sema_down(&thread_current()->pagedir_sema);
+  pte = lookup_page (pd, upage, true);
+
+  if (pte != NULL) 
+    {
+      ASSERT((*pte & PTE_P) == 0);
+      *pte = pte_create_user (kpage, writable);
+			sptable_insert(pd,upage,kpage,writable,evict);
+      ret = true;
+    }
+  else
+    ret = false;
+
+	//sema_up(&thread_current()->pagedir_sema);
+	return ret;
 }
 
 /* Looks up the physical address that corresponds to user virtual
@@ -152,6 +191,7 @@ pagedir_clear_page (uint32_t *pd, void *upage)
   if (pte != NULL && (*pte & PTE_P) != 0)
     {
       *pte &= ~PTE_P;
+			sptable_remove(pd,upage);
       invalidate_pagedir (pd);
     }
 }

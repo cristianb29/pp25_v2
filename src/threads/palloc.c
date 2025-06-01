@@ -10,6 +10,7 @@
 #include "threads/loader.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "vm/vm.h"
 
 /* Page allocator.  Hands out memory in page-size (or
    page-multiple) chunks.  See malloc.h for an allocator that
@@ -77,25 +78,24 @@ palloc_get_multiple (enum palloc_flags flags, size_t page_cnt)
   if (page_cnt == 0)
     return NULL;
 
-  lock_acquire (&pool->lock);
-  page_idx = bitmap_scan_and_flip (pool->used_map, 0, page_cnt, false);
-  lock_release (&pool->lock);
+	ASSERT(page_cnt == 1);
 
-  if (page_idx != BITMAP_ERROR)
-    pages = pool->base + PGSIZE * page_idx;
-  else
-    pages = NULL;
+	lock_acquire(&pool->lock);
+	while(true){
+ 		page_idx = bitmap_scan_and_flip (pool->used_map, 0, page_cnt, false);
+		if(page_idx != BITMAP_ERROR) break;
+		swap_out();
+	}
+ 	lock_release (&pool->lock);
 
-  if (pages != NULL) 
-    {
-      if (flags & PAL_ZERO)
-        memset (pages, 0, PGSIZE * page_cnt);
-    }
-  else 
-    {
-      if (flags & PAL_ASSERT)
-        PANIC ("palloc_get: out of pages");
-    }
+	if (page_idx != BITMAP_ERROR){
+   	pages = pool->base + PGSIZE * page_idx;
+  }else{
+		return NULL;
+	}
+
+  if (flags & PAL_ZERO)
+  	memset (pages, 0, PGSIZE * page_cnt);
 
   return pages;
 }

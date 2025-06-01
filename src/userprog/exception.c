@@ -4,6 +4,10 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/palloc.h"
+#include "userprog/process.h"
+#include "vm/vm.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -126,6 +130,7 @@ page_fault (struct intr_frame *f)
   bool write;        /* True: access was write, false: access was read. */
   bool user;         /* True: access by user, false: access by kernel. */
   void *fault_addr;  /* Fault address. */
+	void *esp;
 
   /* Obtain faulting address, the virtual address that was
      accessed to cause the fault.  It may point to code or to
@@ -148,6 +153,30 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
+	if(!not_present) syscall_exit(-1);
+	if(swap_in(thread_current()->pagedir,pg_round_down(fault_addr),true)) return;
+	if(check_lazy(thread_current()->pagedir,pg_round_down(fault_addr),true,true)) return;
+	if(user){
+		esp = f->esp;
+	}else{
+		esp = thread_current()->esp;
+	}
+	if((PHYS_BASE-0x800000 <= fault_addr && fault_addr < PHYS_BASE) && (esp-32 <= fault_addr)){ // 8MB stack size
+		uint8_t *kpage;
+		bool success;
+			
+		kpage = palloc_get_page(PAL_USER | PAL_ZERO);
+		if(kpage == NULL) syscall_exit(-1);
+		success = install_page(pg_round_down(fault_addr),kpage,check_evict(thread_current()->pagedir,pg_round_down(fault_addr)));
+		if(!success){
+			palloc_free_page(kpage);
+			syscall_exit(-1);
+		}
+		return;
+	}
+
+	syscall_exit(-1);
+
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
      which fault_addr refers. */
@@ -156,6 +185,7 @@ page_fault (struct intr_frame *f)
           not_present ? "not present" : "rights violation",
           write ? "writing" : "reading",
           user ? "user" : "kernel");
+
   kill (f);
 }
 
